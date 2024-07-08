@@ -1,4 +1,7 @@
-use std::io;
+use std::{
+    cmp::Ordering,
+    io::{self, Write},
+};
 
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
@@ -7,12 +10,25 @@ enum State {
     //Listen,
     SyncRcvd,
     Estab,
+    FinWait1,
+}
+
+impl State {
+    pub fn is_synchronized(&self) -> bool {
+        match self {
+            State::SyncRcvd => false,
+            State::Estab => true,
+            State::FinWait1 => true,
+        }
+    }
 }
 
 pub struct Connection {
     state: State,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
+    ip_header: Ipv4Header,
+    tcp_header: TcpHeader,
 }
 
 struct SendSequenceSpace {
@@ -50,20 +66,20 @@ impl Connection {
         tcp_header: TcpHeaderSlice,
         payload: &[u8],
     ) -> Result<Option<Self>, io::Error> {
-        let mut buf = [0u8; 1500];
         if !tcp_header.syn() {
             // only expected SYN packet.
             return Ok(None);
         }
 
         let iss = 0;
-        let connection = Connection {
+        let wnd = 10;
+        let mut connection = Connection {
             state: State::SyncRcvd,
             send: SendSequenceSpace {
                 iss,
                 una: iss,
                 nxt: iss + 1,
-                wnd: 10,
+                wnd,
 
                 // Not sure what those should be.
                 up: false,
@@ -78,42 +94,76 @@ impl Connection {
                 // Not sure about that one.
                 up: false,
             },
+            ip_header: Ipv4Header::new(
+                0,
+                64,
+                IpNumber::TCP,
+                ip_header.destination(),
+                ip_header.source(),
+            )
+            .expect("Failed to construct syn ack ip header"),
+            tcp_header: TcpHeader::new(
+                tcp_header.destination_port(),
+                tcp_header.source_port(),
+                iss,
+                wnd,
+            ),
         };
 
-        let mut syn_ack = TcpHeader::new(
-            tcp_header.destination_port(),
-            tcp_header.source_port(),
-            connection.send.iss,
-            connection.send.wnd,
+        connection.tcp_header.acknowledgment_number = connection.recv.nxt;
+        connection.tcp_header.syn = true;
+        connection.tcp_header.ack = true;
+        connection.write(nic, &[])?;
+        Ok(Some(connection))
+    }
+
+    fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> Result<usize, io::Error> {
+        let mut buf = [0u8; 1500];
+        self.tcp_header.sequence_number = self.send.nxt;
+        self.tcp_header.acknowledgment_number = self.recv.nxt;
+        let size = std::cmp::min(
+            buf.len(),
+            self.tcp_header.header_len() + self.ip_header.header_len() + payload.len(),
         );
-        syn_ack.acknowledgment_number = connection.recv.nxt;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        let ip = Ipv4Header::new(
-            syn_ack.header_len_u16(),
-            64,
-            IpNumber::TCP,
-            ip_header.destination(),
-            ip_header.source(),
-        )
-        .expect("Failed to construct syn ack ip header");
+        self.ip_header
+            .set_payload_len(size)
+            .expect("Failed to set ip header payload length.");
 
         // The kernel does this for us.
-        // syn_ack.checksum = syn_ack
-        //     .calc_checksum_ipv4(&ip, &[])
+        // self.tcp_header.checksum = self.tcp_header
+        //     .calc_checksum_ipv4(&self.ip_header, &[])
         //     .expect("Failed to compute checksum for the syn ack response");
+        let mut unwritten = &mut buf[..];
+        self.ip_header
+            .write(&mut unwritten)
+            .expect("Failed to write ip header for syn ack");
+        self.tcp_header
+            .write(&mut unwritten)
+            .expect("Failed to write syn ack");
+        let payload_n = unwritten.write(payload)? as u32;
+        let unwritten = unwritten.len();
+        self.send.nxt = self.send.nxt.wrapping_add(payload_n);
 
-        let unwritten = {
-            let mut unwritten = &mut buf[..];
-            ip.write(&mut unwritten)
-                .expect("Failed to write ip header for syn ack");
-            syn_ack
-                .write(&mut unwritten)
-                .expect("Failed to write syn ack");
-            unwritten.len()
-        };
-        nic.send(&buf[..buf.len() - unwritten])?;
-        Ok(Some(connection))
+        if self.tcp_header.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp_header.syn = false;
+        }
+        if self.tcp_header.fin {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp_header.fin = false;
+        }
+        let n = nic.send(&buf[..buf.len() - unwritten])?;
+        Ok(n)
+    }
+
+    fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> Result<(), io::Error> {
+        //TODO: Fix sequence numbers
+        self.tcp_header.rst = true;
+        self.tcp_header.sequence_number = 0;
+        self.tcp_header.acknowledgment_number = 0;
+        self.ip_header.set_payload_len(self.tcp_header.header_len()).expect("Couldn't set ip header payload len.");
+        self.write(nic, &[])?;
+        Ok(())
     }
 
     pub fn on_packet(
@@ -123,13 +173,89 @@ impl Connection {
         tcp_header: TcpHeaderSlice,
         payload: &[u8],
     ) -> Result<(), io::Error> {
+        // SND.UNA < SEG.ACK =< SND.NXT
+        let ackn = tcp_header.acknowledgment_number();
+        if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+            /*
+            * Deal with this later
+            if self.state.is_synchronized() {
+                // according to RFC 793 Reset Generation, in this case we should send a RST.
+                self.send.nxt = tcp_header.acknowledgment_number();
+                self.send_rst(nic)?;
+            }
+            */
+            return Ok(());
+        }
+
+        // RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND
+        // RCV.NXT <= SEG.SEQ+SEG.LEN+1 < RCV.NXT.RCV.WND
+        let seqn = tcp_header.sequence_number();
+        let mut slen = payload.len() as u32;
+        if tcp_header.fin() {
+            slen += 1
+        };
+        if tcp_header.syn() {
+            slen += 1
+        };
+        let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
+        if slen == 0 {
+            // zero-length segment has seperate set of acceptence rules.
+            if self.recv.wnd == 0 {
+                if seqn != self.recv.nxt {
+                    return Ok(());
+                }
+            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
+                return Ok(());
+            }
+        } else {
+            if self.recv.wnd == 0 {
+                return Ok(());
+            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
+                && !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn + slen - 1, wend)
+            {
+                return Ok(());
+            }
+        }
+
         match self.state {
             State::SyncRcvd => {
-                Ok(())
-            },
+                if !tcp_header.ack() {
+                    return Ok(());
+                }
+                self.state = State::Estab;
+                // TODO: Needs to be stored in the retransmission queue aswell.
+                self.tcp_header.fin = true;
+                self.write(nic, &[])?;
+                self.state = State::FinWait1;
+                return Ok(());
+            }
             State::Estab => {
-                unimplemented!()
+                if !tcp_header.fin() || !payload.is_empty() {
+                    unimplemented!();
+                }
+
+                self.write(nic, &[])?;
+                Ok(())
+            }
+            State::FinWait1 => todo!(),
+        }
+    }
+}
+
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    match start.cmp(&x) {
+        Ordering::Equal => return false,
+        Ordering::Less => {
+            if end >= start && end <= x {
+                return false;
+            }
+        }
+        Ordering::Greater => {
+            if end > start && end > x {
+            } else {
+                return false;
             }
         }
     }
+    true
 }

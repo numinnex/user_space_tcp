@@ -15,10 +15,12 @@ struct Quad {
 
 fn main() {
     let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
-    let mut nic = tun_tap::Iface::without_packet_info("tun0", Mode::Tun).expect("Failed to create tun interface");
+    let mut nic = tun_tap::Iface::without_packet_info("tun0", Mode::Tun)
+        .expect("Failed to create tun interface");
     let mut buf = vec![0u8; 1504];
     loop {
         let n = nic.recv(&mut buf).expect("Failed to recv on nic");
+        // If no without_packet_info, those are required.
         // let _flags = u16::from_be_bytes([buf[0], buf[1]]);
         // let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
         // if eth_proto != IP_V4_PROTOCOL {
