@@ -11,14 +11,15 @@ enum State {
     SyncRcvd,
     Estab,
     FinWait1,
+    FinWait2,
+    TimeWait,
 }
 
 impl State {
     pub fn is_synchronized(&self) -> bool {
         match self {
             State::SyncRcvd => false,
-            State::Estab => true,
-            State::FinWait1 => true,
+            State::Estab | State::FinWait1 | State::FinWait2 | State::TimeWait => true,
         }
     }
 }
@@ -72,13 +73,13 @@ impl Connection {
         }
 
         let iss = 0;
-        let wnd = 10;
+        let wnd = 1024;
         let mut connection = Connection {
             state: State::SyncRcvd,
             send: SendSequenceSpace {
                 iss,
                 una: iss,
-                nxt: iss + 1,
+                nxt: iss,
                 wnd,
 
                 // Not sure what those should be.
@@ -126,13 +127,13 @@ impl Connection {
             self.tcp_header.header_len() + self.ip_header.header_len() + payload.len(),
         );
         self.ip_header
-            .set_payload_len(size)
+            .set_payload_len(size - self.ip_header.header_len())
             .expect("Failed to set ip header payload length.");
+        self.tcp_header.checksum = self
+            .tcp_header
+            .calc_checksum_ipv4(&self.ip_header, &[])
+            .expect("Failed to compute checksum for the syn ack response");
 
-        // The kernel does this for us.
-        // self.tcp_header.checksum = self.tcp_header
-        //     .calc_checksum_ipv4(&self.ip_header, &[])
-        //     .expect("Failed to compute checksum for the syn ack response");
         let mut unwritten = &mut buf[..];
         self.ip_header
             .write(&mut unwritten)
@@ -161,7 +162,9 @@ impl Connection {
         self.tcp_header.rst = true;
         self.tcp_header.sequence_number = 0;
         self.tcp_header.acknowledgment_number = 0;
-        self.ip_header.set_payload_len(self.tcp_header.header_len()).expect("Couldn't set ip header payload len.");
+        self.ip_header
+            .set_payload_len(self.tcp_header.header_len())
+            .expect("Couldn't set ip header payload len.");
         self.write(nic, &[])?;
         Ok(())
     }
@@ -173,20 +176,7 @@ impl Connection {
         tcp_header: TcpHeaderSlice,
         payload: &[u8],
     ) -> Result<(), io::Error> {
-        // SND.UNA < SEG.ACK =< SND.NXT
-        let ackn = tcp_header.acknowledgment_number();
-        if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-            /*
-            * Deal with this later
-            if self.state.is_synchronized() {
-                // according to RFC 793 Reset Generation, in this case we should send a RST.
-                self.send.nxt = tcp_header.acknowledgment_number();
-                self.send_rst(nic)?;
-            }
-            */
-            return Ok(());
-        }
-
+        eprintln!("Got packet");
         // RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND
         // RCV.NXT <= SEG.SEQ+SEG.LEN+1 < RCV.NXT.RCV.WND
         let seqn = tcp_header.sequence_number();
@@ -198,64 +188,105 @@ impl Connection {
             slen += 1
         };
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
-        if slen == 0 {
+        let okay = if slen == 0 {
             // zero-length segment has seperate set of acceptence rules.
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
-                return Ok(());
+                false
+            } else {
+                true
             }
         } else {
             if self.recv.wnd == 0 {
-                return Ok(());
+                false
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
-                && !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn + slen - 1, wend)
+                && !is_between_wrapped(
+                    self.recv.nxt.wrapping_sub(1),
+                    seqn.wrapping_add(slen - 1),
+                    wend,
+                )
             {
-                return Ok(());
+                false
+            } else {
+                true
             }
+        };
+        if !okay {
+            self.write(nic, &[])?;
+            return Ok(());
+        }
+        self.recv.nxt = seqn.wrapping_add(slen);
+
+        if !tcp_header.ack() {
+            return Ok(());
         }
 
-        match self.state {
-            State::SyncRcvd => {
-                if !tcp_header.ack() {
-                    return Ok(());
-                }
+        let ackn = tcp_header.acknowledgment_number();
+        if let State::SyncRcvd = self.state {
+            if is_between_wrapped(
+                self.send.una.wrapping_sub(1),
+                ackn,
+                self.send.nxt.wrapping_add(1),
+            ) {
                 self.state = State::Estab;
-                // TODO: Needs to be stored in the retransmission queue aswell.
+            } else {
+                // TODO: RST
+            }
+        }
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            println!("got here");
+            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                return Ok(());
+            }
+            self.send.una = ackn;
+            assert!(payload.is_empty());
+
+            // Terminate the connection
+            if let State::Estab = self.state {
                 self.tcp_header.fin = true;
                 self.write(nic, &[])?;
                 self.state = State::FinWait1;
-                return Ok(());
             }
-            State::Estab => {
-                if !tcp_header.fin() || !payload.is_empty() {
-                    unimplemented!();
-                }
-
-                self.write(nic, &[])?;
-                Ok(())
-            }
-            State::FinWait1 => todo!(),
         }
+
+        if let State::FinWait1 = self.state {
+            if self.send.una == self.send.iss + 2 {
+                // Our FIN has been ACKed.
+                println!("THEY ACKED OUR FIN");
+                self.state = State::FinWait2;
+            }
+        }
+
+        if tcp_header.fin() {
+            match self.state {
+                State::FinWait2 => {
+                    println!("THEY HAVE CLOSED");
+                    self.write(nic, &[])?;
+                    self.state = State::TimeWait;
+                }
+                _ => unimplemented!(),
+            }
+        }
+        Ok(())
     }
 }
 
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    // From RFC1323:
+    //     TCP determines if a data segment is "old" or "new" by testing
+    //     whether its sequence number is within 2**31 bytes of the left edge
+    //     of the window, and if it is not, discarding the data as "old".  To
+    //     ensure that new data is never mistakenly considered old and vice-
+    //     versa, the left edge of the sender's window has to be at most
+    //     2**31 away from the right edge of the receiver's window.
+    lhs.wrapping_sub(rhs) > (1 << 31)
+}
+
 fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-    match start.cmp(&x) {
-        Ordering::Equal => return false,
-        Ordering::Less => {
-            if end >= start && end <= x {
-                return false;
-            }
-        }
-        Ordering::Greater => {
-            if end > start && end > x {
-            } else {
-                return false;
-            }
-        }
-    }
-    true
+    wrapping_lt(start, x) && wrapping_lt(x, end)
 }
