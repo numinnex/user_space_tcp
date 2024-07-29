@@ -1,5 +1,5 @@
 use std::{
-    cmp::Ordering,
+    collections::VecDeque,
     io::{self, Write},
 };
 
@@ -30,6 +30,9 @@ pub struct Connection {
     recv: RecvSequenceSpace,
     ip_header: Ipv4Header,
     tcp_header: TcpHeader,
+
+    pub(crate) incomming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }
 
 struct SendSequenceSpace {
@@ -109,6 +112,8 @@ impl Connection {
                 iss,
                 wnd,
             ),
+            incomming: VecDeque::new(),
+            unacked: VecDeque::new(),
         };
 
         connection.tcp_header.acknowledgment_number = connection.recv.nxt;
