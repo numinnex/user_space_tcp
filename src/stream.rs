@@ -1,4 +1,4 @@
-use crate::tcp;
+use crate::tcp::{self, Available};
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     io::{self, Read, Write},
@@ -21,6 +21,7 @@ struct Quad {
 struct Handler {
     coordinator: Mutex<ConnectionCoordinator>,
     pending_var: Condvar,
+    rcv_var: Condvar,
 }
 
 type InterfaceHandle = Arc<Handler>;
@@ -59,7 +60,6 @@ struct ConnectionCoordinator {
 
 fn packet_loop(mut nic: tun_tap::Iface, handler: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
-
     loop {
         //TODO: set a timeout for TCP timers and termiantion of coordinator
         let n = nic.recv(&mut buf).expect("Failed to recv on nic");
@@ -70,7 +70,7 @@ fn packet_loop(mut nic: tun_tap::Iface, handler: InterfaceHandle) -> io::Result<
         //     continue;
         // }
 
-        //TODO: if self.terminate && Arc::get_strong_count(&conn_cord) == 1
+        // TODO: if self.terminate && Arc::get_strong_count(&conn_cord) == 1
         // tear down all connections
 
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[..n]) {
@@ -97,9 +97,19 @@ fn packet_loop(mut nic: tun_tap::Iface, handler: InterfaceHandle) -> io::Result<
                         };
                         match conn_cord.connections.entry(quad) {
                             Entry::Occupied(mut c) => {
-                                c.get_mut()
+                                let conn_availability = c
+                                    .get_mut()
                                     .on_packet(&mut nic, ip_header, tcp_header, &buf[data_pos..n])
                                     .expect("Failed to handle packet");
+                                drop(conn_cord_guard);
+                                if conn_availability.contains(Available::READ) {
+                                    eprintln!("Now available for reading");
+                                    handler.rcv_var.notify_all();
+                                }
+                                if conn_availability.contains(Available::WRITE) {
+                                    eprintln!("now asjdhasjda");
+                                    // handler.send_var.notify_all();
+                                }
                             }
                             Entry::Vacant(e) => {
                                 if let Some(pending) =
@@ -186,31 +196,32 @@ impl Drop for TcpStream {
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut conn_cord = self.1.coordinator.lock().unwrap();
-        let conn = conn_cord.connections.get_mut(&self.0).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "Connection not found, despite TcpStream being preset.",
-            )
-        })?;
+        loop {
+            let conn = conn_cord.connections.get_mut(&self.0).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Connection not found, despite TcpStream being preset.",
+                )
+            })?;
 
-        if conn.incomming.is_empty() {
-            // TODO: Block
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "No data available",
-            ));
+            if conn.is_rcv_closed() && conn.incomming.is_empty() {
+                return Ok(0);
+            }
+            if !conn.incomming.is_empty() {
+                //TODO: return FIN if nread == 0
+                let mut nread = 0;
+                let (head, tail) = conn.incomming.as_slices();
+                let hread = std::cmp::min(buf.len(), head.len());
+                buf.copy_from_slice(&head[..hread]);
+                let tread = std::cmp::min(buf.len() - hread, tail.len());
+                buf.copy_from_slice(&tail[..tread]);
+                nread += tread;
+                drop(conn.incomming.drain(..nread));
+                return Ok(nread);
+            }
+
+            conn_cord = self.1.rcv_var.wait(conn_cord).unwrap();
         }
-
-        //TODO: return FIN if nread == 0
-        let mut nread = 0;
-        let (head, tail) = conn.incomming.as_slices();
-        let hread = std::cmp::min(buf.len(), head.len());
-        buf.copy_from_slice(&head[..hread]);
-        let tread = std::cmp::min(buf.len() - hread, tail.len());
-        buf.copy_from_slice(&tail[..tread]);
-        nread += tread;
-        drop(conn.incomming.drain(..nread));
-        Ok(nread)
     }
 }
 

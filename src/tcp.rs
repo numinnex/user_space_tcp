@@ -3,8 +3,10 @@ use std::{
     io::{self, Write},
 };
 
+use bitflags::bitflags;
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
+#[derive(Debug)]
 enum State {
     //Closed,
     //Listen,
@@ -13,6 +15,13 @@ enum State {
     FinWait1,
     FinWait2,
     TimeWait,
+}
+
+bitflags! {
+    pub struct Available: u8 {
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
+    }
 }
 
 impl State {
@@ -33,6 +42,26 @@ pub struct Connection {
 
     pub(crate) incomming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_rcv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            // TODO: CLOSE-WAIT, LAST-ACK, CLOSED, CLOSING
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn availability(&self) -> Available {
+        let mut a = Available::empty();
+        if self.is_rcv_closed() || !self.incomming.is_empty() {
+            a |= Available::READ;
+        }
+        // TODO: Set available WRITE
+        a
+    }
 }
 
 struct SendSequenceSpace {
@@ -112,11 +141,11 @@ impl Connection {
                 iss,
                 wnd,
             ),
-            incomming: VecDeque::new(),
-            unacked: VecDeque::new(),
+            incomming: Default::default(),
+            unacked: Default::default()
         };
 
-        connection.tcp_header.acknowledgment_number = connection.recv.nxt;
+        //connection.tcp_header.acknowledgment_number = connection.recv.nxt;
         connection.tcp_header.syn = true;
         connection.tcp_header.ack = true;
         connection.write(nic, &[])?;
@@ -180,8 +209,11 @@ impl Connection {
         ip_header: Ipv4HeaderSlice,
         tcp_header: TcpHeaderSlice,
         payload: &[u8],
-    ) -> Result<(), io::Error> {
-        eprintln!("Got packet");
+    ) -> Result<Available, io::Error> {
+        // !!!!!
+        // Not recv their FIN ACK with ack = 2.
+        // !!!!!
+
         // RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND
         // RCV.NXT <= SEG.SEQ+SEG.LEN+1 < RCV.NXT.RCV.WND
         let seqn = tcp_header.sequence_number();
@@ -194,7 +226,7 @@ impl Connection {
         };
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
         let okay = if slen == 0 {
-            // zero-length segment has seperate set of acceptence rules.
+            // zero-length segment has separate rules for acceptance
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
                     false
@@ -223,12 +255,15 @@ impl Connection {
         };
         if !okay {
             self.write(nic, &[])?;
-            return Ok(());
+            return Ok(self.availability());
         }
         self.recv.nxt = seqn.wrapping_add(slen);
 
         if !tcp_header.ack() {
-            return Ok(());
+            if tcp_header.syn() {
+                self.recv.nxt = seqn.wrapping_add(1)
+            }
+            return Ok(self.availability());
         }
 
         let ackn = tcp_header.acknowledgment_number();
@@ -245,10 +280,14 @@ impl Connection {
         }
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             println!("got here");
-            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                println!(
+                    "ack for {} (last: {}); prune in {:?}",
+                    ackn, self.send.una, self.unacked
+                );
+
+                self.send.una = ackn; 
             }
-            self.send.una = ackn;
             assert!(payload.is_empty());
 
             // Terminate the connection
@@ -271,13 +310,14 @@ impl Connection {
             match self.state {
                 State::FinWait2 => {
                     println!("THEY HAVE CLOSED");
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
                     self.write(nic, &[])?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
             }
         }
-        Ok(())
+        Ok(self.availability())
     }
 }
 

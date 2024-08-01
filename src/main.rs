@@ -6,8 +6,8 @@ mod tcp;
 fn main() {
     let mut tcp_interface = stream::Interface::default();
     let listener = tcp_interface
-        .bind(9000)
-        .expect("Failed to bind to a port 9000 for our user space tcp interface");
+        .bind(5900)
+        .expect("Failed to bind to a port 4600 for our user space tcp interface");
     std::thread::spawn(move || {
         while let Ok(mut stream) = listener.try_accept() {
             eprintln!("Accepted a connection");
